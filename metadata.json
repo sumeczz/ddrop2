@@ -1,0 +1,6 @@
+{
+  "name": "My Dead Drops",
+  "description": "Anonymní platforma pro sdílení lokací úschov (dead drops) chráněných PIN kódem.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

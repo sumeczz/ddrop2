@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+/* Tactical dark mode filter for standard free OpenStreetMap tiles (no watermarks, 100% free) */
+.leaflet-dark-tiles {
+  filter: brightness(0.65) invert(1) contrast(2.5) hue-rotate(205deg) saturate(0.25) brightness(0.75);
+}
