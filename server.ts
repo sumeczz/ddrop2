@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 
 export type DropStatus = 'CREATED' | 'VIEWED' | 'COLLECTED' | 'NOT_FOUND' | 'EXPIRED';
+export type PaymentStatus = 'UNPAID' | 'PENDING_CONFIRMATION' | 'CONFIRMED' | 'REJECTED';
 
 interface StatusHistoryItem {
   status: DropStatus;
@@ -32,16 +33,39 @@ interface StoredDrop {
   currency?: string;
   isPaid?: boolean;
   paidAt?: number;
-  paymentMethod?: 'CRYPTO' | 'PAYSAFECARD';
-  cryptoType?: 'BTC' | 'XMR' | 'USDT';
-  cryptoAddress?: string;
+  paymentMethod?: 'PAYSAFECARD';
+  paymentStatus?: PaymentStatus;
+  pscCode?: string;
+  pscSubmittedAt?: number;
+  pscExpiresAt?: number;
   burnerAlert?: string;
   burnerAlertSetAt?: number;
+}
+
+export type RequestDropStatus = 'PENDING' | 'ACCEPTED' | 'FULFILLED' | 'REJECTED';
+
+interface StoredCustomerRequest {
+  id: string;
+  requestCode: string;
+  latitude: number;
+  longitude: number;
+  locationDescription?: string;
+  amount: string;
+  price: number;
+  currency: string;
+  pscTiming: 'NOW' | 'LATER';
+  pscCode?: string;
+  pscConfirmed?: boolean;
+  note?: string;
+  status: RequestDropStatus;
+  createdAt: number;
+  fulfilledDropPin?: string;
 }
 
 // Ensure data storage directory
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DATA_FILE = path.join(DATA_DIR, 'drops.json');
+const REQUESTS_FILE = path.join(DATA_DIR, 'requests.json');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -49,15 +73,15 @@ if (!fs.existsSync(DATA_DIR)) {
 
 // Load initial drops or empty map
 let dropsStore: Map<string, StoredDrop> = new Map();
+let requestsStore: Map<string, StoredCustomerRequest> = new Map();
 
-function loadDropsFromDisk() {
+function loadDataFromDisk() {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const content = fs.readFileSync(DATA_FILE, 'utf-8');
       const parsed = JSON.parse(content) as StoredDrop[];
       const now = Date.now();
       parsed.forEach((d) => {
-        // Upgrade legacy records if missing status or history
         if (!d.status) d.status = d.claimedAt ? 'VIEWED' : 'CREATED';
         if (!d.history || !Array.isArray(d.history)) {
           d.history = [{ status: 'CREATED', timestamp: d.createdAt, note: 'Úschova vytvořena' }];
@@ -66,7 +90,10 @@ function loadDropsFromDisk() {
           }
         }
         if (d.isPaid === undefined) {
-          d.isPaid = !d.price;
+          d.isPaid = !d.price || d.price <= 0;
+        }
+        if (!d.paymentStatus) {
+          d.paymentStatus = d.isPaid ? 'CONFIRMED' : 'UNPAID';
         }
 
         if (d.expiresAt > now) {
@@ -77,8 +104,17 @@ function loadDropsFromDisk() {
       });
       console.log(`[Storage] Loaded ${dropsStore.size} active dead drops from disk.`);
     }
+
+    if (fs.existsSync(REQUESTS_FILE)) {
+      const content = fs.readFileSync(REQUESTS_FILE, 'utf-8');
+      const parsed = JSON.parse(content) as StoredCustomerRequest[];
+      parsed.forEach((r) => {
+        requestsStore.set(r.id, r);
+      });
+      console.log(`[Storage] Loaded ${requestsStore.size} customer requests from disk.`);
+    }
   } catch (err) {
-    console.error('[Storage] Error loading drops from disk:', err);
+    console.error('[Storage] Error loading data from disk:', err);
   }
 }
 
@@ -91,13 +127,24 @@ function saveDropsToDisk() {
   }
 }
 
-loadDropsFromDisk();
+function saveRequestsToDisk() {
+  try {
+    const list = Array.from(requestsStore.values());
+    fs.writeFileSync(REQUESTS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[Storage] Error saving requests to disk:', err);
+  }
+}
 
-// Cleanup expired drops periodically (every 5 minutes)
+loadDataFromDisk();
+
+// Cleanup expired drops and check 30min PSC timer periodically (every 1 minute)
 setInterval(() => {
   const now = Date.now();
   let changed = false;
+
   for (const [id, drop] of dropsStore.entries()) {
+    // 7-day TTL expiration
     if (drop.expiresAt <= now && drop.status !== 'EXPIRED') {
       drop.status = 'EXPIRED';
       drop.history.push({
@@ -107,11 +154,27 @@ setInterval(() => {
       });
       changed = true;
     }
+
+    // 30min PSC verification timer expiration
+    if (
+      drop.paymentStatus === 'PENDING_CONFIRMATION' &&
+      drop.pscExpiresAt &&
+      drop.pscExpiresAt <= now
+    ) {
+      drop.paymentStatus = 'REJECTED';
+      drop.history.push({
+        status: drop.status,
+        timestamp: now,
+        note: 'Vypršel 30minutový limit na ověření PaySafeCard kódu vendorem. Objednávka byla zrušena.',
+      });
+      changed = true;
+    }
   }
+
   if (changed) {
     saveDropsToDisk();
   }
-}, 5 * 60 * 1000);
+}, 60 * 1000);
 
 // Safe characters for PIN
 const PIN_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -129,68 +192,112 @@ function hashPin(pin: string): string {
   return crypto.createHash('sha256').update(pin.trim().toUpperCase()).digest('hex');
 }
 
-// Generate realistic mock crypto address for customer payment demonstration
-function generateDemoCryptoAddress(type: 'BTC' | 'XMR' | 'USDT'): string {
-  if (type === 'XMR') {
-    return '888tNkZrPN6JsEAnStBaF4ZUnB13EB6CNSmFPXbkHybAbAAGPdjWw3i2b4fG...';
+// Rate Limiter against Brute-force PIN attacks
+interface RateLimitEntry {
+  attempts: number;
+  blockedUntil: number;
+}
+const rateLimits: Map<string, RateLimitEntry> = new Map();
+
+function isIpBlocked(ip: string): boolean {
+  const entry = rateLimits.get(ip);
+  if (!entry) return false;
+  if (Date.now() < entry.blockedUntil) {
+    return true;
   }
-  if (type === 'USDT') {
-    return '0x71C...B29F (TRC-20 / ERC-20)';
+  if (Date.now() >= entry.blockedUntil && entry.blockedUntil > 0) {
+    rateLimits.delete(ip);
   }
-  return 'bc1q' + crypto.randomBytes(16).toString('hex');
+  return false;
 }
 
-// Brute-force rate limiting: track failed attempts per IP
-const failedAttemptsMap = new Map<string, { count: number; blockedUntil: number }>();
-
-function isIpRateLimited(ip: string): boolean {
-  const record = failedAttemptsMap.get(ip);
-  if (!record) return false;
-  if (Date.now() > record.blockedUntil) {
-    failedAttemptsMap.delete(ip);
-    return false;
-  }
-  return record.count >= 6;
-}
-
-function recordFailedAttempt(ip: string) {
+function recordFailedAttempt(ip: string): void {
   const now = Date.now();
-  const record = failedAttemptsMap.get(ip) || { count: 0, blockedUntil: now + 15 * 60 * 1000 };
-  record.count += 1;
-  record.blockedUntil = now + 15 * 60 * 1000;
-  failedAttemptsMap.set(ip, record);
+  const entry = rateLimits.get(ip) || { attempts: 0, blockedUntil: 0 };
+  entry.attempts += 1;
+  if (entry.attempts >= 5) {
+    entry.blockedUntil = now + 15 * 60 * 1000;
+  }
+  rateLimits.set(ip, entry);
 }
 
-function resetFailedAttempts(ip: string) {
-  failedAttemptsMap.delete(ip);
+function resetFailedAttempts(ip: string): void {
+  rateLimits.delete(ip);
+}
+
+// Sanitizes drop object before sending to customer (hides exact coordinates and photos if unpaid)
+function sanitizeDropForCustomer(drop: StoredDrop) {
+  const needsPayment = (drop.price || 0) > 0 && !drop.isPaid;
+  const maskedPsc = drop.pscCode ? `****-****-****-${drop.pscCode.slice(-4)}` : undefined;
+
+  if (needsPayment) {
+    return {
+      ...drop,
+      rawPin: undefined,
+      latitude: 0,
+      longitude: 0,
+      photos: [],
+      description: drop.description ? 'Poloha a přesný popis úschovy budou odemčeny po manuálním potvrzení platby PaySafeCard vendorem.' : '',
+      exactLocationLocked: true,
+      submittedPscCode: maskedPsc,
+    };
+  }
+
+  return {
+    ...drop,
+    rawPin: undefined,
+    exactLocationLocked: false,
+    submittedPscCode: maskedPsc,
+  };
 }
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '20mb' }));
+  app.use(express.json({ limit: '25mb' }));
 
-  // Health check endpoint
+  // GET /api/health
   app.get('/api/health', (req, res) => {
     res.json({
       status: 'ok',
       activeDrops: dropsStore.size,
-      timestamp: Date.now(),
+      activeRequests: requestsStore.size,
+      time: new Date().toISOString(),
     });
   });
 
-  // GET /api/drops - List all drops for vendor admin dashboard
+  // GET /api/drops - Admin/Vendor list of all drops
   app.get('/api/drops', (req, res) => {
     try {
       const list = Array.from(dropsStore.values()).sort((a, b) => b.createdAt - a.createdAt);
-      res.json({ success: true, drops: list });
+      res.json({
+        success: true,
+        drops: list,
+      });
     } catch (err: any) {
       res.status(500).json({ success: false, error: 'Chyba při načítání úschov.' });
     }
   });
 
-  // POST /api/drops - Create a new Dead Drop
+  // GET /api/drops/:id - Single drop detail (sanitized for customer)
+  app.get('/api/drops/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      const drop = dropsStore.get(id);
+      if (!drop) {
+        return res.status(404).json({ success: false, error: 'Úschova nenalezena.' });
+      }
+      res.json({
+        success: true,
+        drop: sanitizeDropForCustomer(drop),
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: 'Chyba při načítání úschovy.' });
+    }
+  });
+
+  // POST /api/drops - Vendor creates a new drop
   app.post('/api/drops', (req, res) => {
     try {
       const {
@@ -201,120 +308,90 @@ async function startServer() {
         burnAfterReading,
         amount,
         price,
-        currency = 'CZK',
+        currency,
         burnerAlert,
-        cryptoType = 'BTC',
       } = req.body;
 
-      if (!description || typeof description !== 'string') {
+      if (!description || typeof description !== 'string' || description.trim().length === 0) {
         return res.status(400).json({ success: false, error: 'Popis úschovy je povinný.' });
       }
 
       if (description.length > 500) {
-        return res.status(400).json({ success: false, error: 'Popis přesahuje limit 500 znaků.' });
+        return res.status(400).json({ success: false, error: 'Popis nesmí přesáhnout 500 znaků.' });
       }
 
-      if (typeof latitude !== 'number' || typeof longitude !== 'number' || isNaN(latitude) || isNaN(longitude)) {
-        return res.status(400).json({ success: false, error: 'Neplatné zeměpisné souřadnice.' });
+      if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+        return res.status(400).json({ success: false, error: 'Platné GPS souřadnice jsou povinné.' });
       }
 
       if (!Array.isArray(photos) || photos.length < 1 || photos.length > 3) {
-        return res.status(400).json({ success: false, error: 'Vyžaduje se nahrání 1 až 3 fotografií.' });
+        return res.status(400).json({ success: false, error: 'Musíte nahrát 1 až 3 fotografie.' });
       }
 
-      // Generate unique PIN
-      let rawPin = '';
-      let pinHash = '';
-      let isUnique = false;
-      let attempts = 0;
-
-      while (!isUnique && attempts < 20) {
-        rawPin = generateRandomPin(6);
-        pinHash = hashPin(rawPin);
-        isUnique = !Array.from(dropsStore.values()).some((d) => d.pinHash === pinHash && d.expiresAt > Date.now());
-        attempts++;
-      }
-
-      if (!isUnique) {
-        return res.status(500).json({ success: false, error: 'Chyba při generování PIN kódu.' });
-      }
-
-      const id = crypto.randomUUID();
+      const generatedPin = generateRandomPin(6);
+      const hashed = hashPin(generatedPin);
       const now = Date.now();
-      const expiresAt = now + 7 * 24 * 60 * 60 * 1000; // 7 days TTL
+      const expiresAt = now + 7 * 24 * 60 * 60 * 1000; // 7 days
 
-      const formattedPhotos = photos.map((p, idx) => ({
-        id: `photo-${idx + 1}-${Date.now()}`,
-        dataUrl: p.dataUrl,
-        sizeBytes: p.sizeBytes || 0,
-      }));
-
-      const parsedPrice = price ? Math.max(0, Number(price)) : 0;
-      const initialPaid = parsedPrice === 0;
-
-      const history: StatusHistoryItem[] = [
-        {
-          status: 'CREATED',
-          timestamp: now,
-          note: parsedPrice > 0 ? `Vytvořeno s cenou ${parsedPrice} ${currency}` : 'Vytvořena úschova (zdarma / předplaceno)',
-        },
-      ];
-
-      if (burnerAlert && burnerAlert.trim()) {
-        history.push({
-          status: 'CREATED',
-          timestamp: now,
-          note: `Nouzová zpráva: ${burnerAlert.trim().slice(0, 80)}`,
-        });
-      }
+      const numericPrice = typeof price === 'number' && price > 0 ? price : 0;
+      const isPaidInitial = numericPrice === 0;
 
       const newDrop: StoredDrop = {
-        id,
-        pinHash,
-        rawPin,
+        id: crypto.randomUUID(),
+        pinHash: hashed,
+        rawPin: generatedPin,
         description: description.trim(),
         latitude,
         longitude,
-        photos: formattedPhotos,
+        photos: photos.map((p, idx) => ({
+          id: `photo-${idx}-${Date.now()}`,
+          dataUrl: p.dataUrl,
+          sizeBytes: p.sizeBytes || p.dataUrl.length,
+        })),
         createdAt: now,
         expiresAt,
         burnAfterReading: Boolean(burnAfterReading),
         viewCount: 0,
         claimedAt: null,
         status: 'CREATED',
-        history,
+        history: [
+          {
+            status: 'CREATED',
+            timestamp: now,
+            note: 'Úschova byla úspěšně vytvořena vendorem',
+          },
+        ],
         amount: amount ? String(amount).trim() : undefined,
-        price: parsedPrice > 0 ? parsedPrice : undefined,
-        currency,
-        isPaid: initialPaid,
-        cryptoType,
-        cryptoAddress: parsedPrice > 0 ? generateDemoCryptoAddress(cryptoType) : undefined,
-        burnerAlert: burnerAlert?.trim() || undefined,
-        burnerAlertSetAt: burnerAlert?.trim() ? now : undefined,
+        price: numericPrice,
+        currency: currency || 'CZK',
+        isPaid: isPaidInitial,
+        paymentStatus: isPaidInitial ? 'CONFIRMED' : 'UNPAID',
+        burnerAlert: burnerAlert ? String(burnerAlert).trim() : undefined,
+        burnerAlertSetAt: burnerAlert ? now : undefined,
       };
 
-      dropsStore.set(id, newDrop);
+      dropsStore.set(newDrop.id, newDrop);
       saveDropsToDisk();
 
       res.status(201).json({
         success: true,
-        pin: rawPin,
+        pin: generatedPin,
         expiresAt,
         burnAfterReading: newDrop.burnAfterReading,
-        message: 'Dead drop byl úspěšně vytvořen.',
+        message: 'Úschova byla bezpečně uložena.',
       });
     } catch (err: any) {
       console.error('[API] Error creating drop:', err);
-      res.status(500).json({ success: false, error: 'Chyba při ukládání úschovy.' });
+      res.status(500).json({ success: false, error: 'Chyba při vytváření úschovy.' });
     }
   });
 
-  // POST /api/drops/claim - Claim and view drop by PIN
+  // POST /api/drops/claim - Customer enters PIN
   app.post('/api/drops/claim', (req, res) => {
     try {
       const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
 
-      if (isIpRateLimited(clientIp)) {
+      if (isIpBlocked(clientIp)) {
         return res.status(429).json({
           success: false,
           error: 'Příliš mnoho neúspěšných pokusů o zadání PINu. Zkuste to za 15 minut.',
@@ -369,7 +446,7 @@ async function startServer() {
 
       return res.json({
         success: true,
-        drop: foundDrop,
+        drop: sanitizeDropForCustomer(foundDrop),
       });
     } catch (err: any) {
       console.error('[API] Error claiming drop:', err);
@@ -408,25 +485,105 @@ async function startServer() {
         note: note ? note.trim() : defaultNote,
       });
 
-      // If burn after reading was enabled and collected, remove
       if (drop.burnAfterReading && status === 'COLLECTED') {
         dropsStore.delete(drop.id);
       }
 
       saveDropsToDisk();
 
-      res.json({ success: true, drop });
+      res.json({ success: true, drop: sanitizeDropForCustomer(drop) });
     } catch (err: any) {
       console.error('[API] Error updating drop status:', err);
       res.status(500).json({ success: false, error: 'Chyba při změně stavu úschovy.' });
     }
   });
 
-  // POST /api/drops/:id/pay - Process payment (PaySafeCard or Crypto)
-  app.post('/api/drops/:id/pay', (req, res) => {
+  // POST /api/drops/:id/pay or /pay-psc - Customer submits PaySafeCard PIN (Starts 30min verification timer)
+  const handlePscPayment = (req: express.Request, res: express.Response) => {
     try {
       const { id } = req.params;
-      const { method, pscCode, cryptoTx } = req.body;
+      const { pscCode } = req.body;
+
+      const drop = dropsStore.get(id);
+      if (!drop) {
+        return res.status(404).json({ success: false, error: 'Úschova nenalezena.' });
+      }
+
+      if (!pscCode || typeof pscCode !== 'string') {
+        return res.status(400).json({ success: false, error: 'Zadejte 16místný PaySafeCard PIN kód.' });
+      }
+
+      const cleanedPsc = pscCode.replace(/[\s-]/g, '');
+      if (cleanedPsc.length !== 16 || !/^\d{16}$/.test(cleanedPsc)) {
+        return res.status(400).json({ success: false, error: 'PaySafeCard PIN musí obsahovat přesně 16 číslic.' });
+      }
+
+      const now = Date.now();
+      drop.paymentMethod = 'PAYSAFECARD';
+      drop.pscCode = cleanedPsc;
+      drop.pscSubmittedAt = now;
+      drop.pscExpiresAt = now + 30 * 60 * 1000; // 30 minutes verification timer
+      drop.paymentStatus = 'PENDING_CONFIRMATION';
+      drop.isPaid = false; // Remains unconfirmed until vendor verifies!
+
+      drop.history.push({
+        status: drop.status,
+        timestamp: now,
+        note: `Zákazník odeslal PaySafeCard PIN (****-****-****-${cleanedPsc.slice(-4)}) za ${drop.price} ${drop.currency}. Běží 30minutový časovač na ověření vendorem.`,
+      });
+
+      saveDropsToDisk();
+
+      res.json({
+        success: true,
+        drop: sanitizeDropForCustomer(drop),
+        message: 'PaySafeCard kód byl odeslán. Čeká se na manuální ověření vendorem.',
+      });
+    } catch (err: any) {
+      console.error('[API] Error submitting PSC payment:', err);
+      res.status(500).json({ success: false, error: 'Chyba při zpracování PaySafeCard.' });
+    }
+  };
+
+  app.post('/api/drops/:id/pay', handlePscPayment);
+  app.post('/api/drops/:id/pay-psc', handlePscPayment);
+
+  // POST /api/drops/:id/cancel-payment or /pay-psc/cancel - Customer cancels pending PSC submission
+  const handleCancelPayment = (req: express.Request, res: express.Response) => {
+    try {
+      const { id } = req.params;
+      const drop = dropsStore.get(id);
+      if (!drop) {
+        return res.status(404).json({ success: false, error: 'Úschova nenalezena.' });
+      }
+
+      if (drop.paymentStatus === 'PENDING_CONFIRMATION') {
+        drop.paymentStatus = 'UNPAID';
+        drop.pscCode = undefined;
+        drop.pscSubmittedAt = undefined;
+        drop.pscExpiresAt = undefined;
+        drop.history.push({
+          status: drop.status,
+          timestamp: Date.now(),
+          note: 'Zákazník zrušil odeslaný PaySafeCard požadavek.',
+        });
+        saveDropsToDisk();
+      }
+
+      res.json({ success: true, drop: sanitizeDropForCustomer(drop) });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: 'Chyba při rušení platby.' });
+    }
+  };
+
+  app.post('/api/drops/:id/cancel-payment', handleCancelPayment);
+  app.post('/api/drops/:id/pay-psc/cancel', handleCancelPayment);
+
+  // POST /api/drops/:id/confirm-payment - Vendor manually confirms or rejects PSC code
+  app.post('/api/drops/:id/confirm-payment', (req, res) => {
+    try {
+      const { id } = req.params;
+      const { action, reason } = req.body; // 'CONFIRM' or 'REJECT'
 
       const drop = dropsStore.get(id);
       if (!drop) {
@@ -435,41 +592,32 @@ async function startServer() {
 
       const now = Date.now();
 
-      if (method === 'PAYSAFECARD') {
-        if (!pscCode || typeof pscCode !== 'string') {
-          return res.status(400).json({ success: false, error: 'Zadejte 16místný PaySafeCard PIN kód.' });
-        }
-        const cleanedPsc = pscCode.replace(/[\s-]/g, '');
-        if (cleanedPsc.length !== 16 || !/^\d{16}$/.test(cleanedPsc)) {
-          return res.status(400).json({ success: false, error: 'PaySafeCard PIN musí obsahovat přesně 16 číslic (4x4).' });
-        }
-
+      if (action === 'CONFIRM') {
         drop.isPaid = true;
         drop.paidAt = now;
-        drop.paymentMethod = 'PAYSAFECARD';
+        drop.paymentStatus = 'CONFIRMED';
         drop.history.push({
           status: drop.status,
           timestamp: now,
-          note: `Platba PaySafeCard PIN (****-****-****-${cleanedPsc.slice(-4)}) přijata za ${drop.price} ${drop.currency}`,
+          note: `Vendor ověřil a schválil PaySafeCard kód. Platba za ${drop.price} ${drop.currency} potvrzena. Lokace odemčena zákazníkovi.`,
         });
-      } else if (method === 'CRYPTO') {
-        drop.isPaid = true;
-        drop.paidAt = now;
-        drop.paymentMethod = 'CRYPTO';
+      } else if (action === 'REJECT') {
+        drop.isPaid = false;
+        drop.paymentStatus = 'REJECTED';
         drop.history.push({
           status: drop.status,
           timestamp: now,
-          note: `Platba v kryptoměně (${drop.cryptoType || 'BTC'}) ověřena v síti za ${drop.price} ${drop.currency}`,
+          note: `Vendor zamítl PaySafeCard kód (${reason || 'kód je neplatný nebo byl již vyčerpán'}).`,
         });
       } else {
-        return res.status(400).json({ success: false, error: 'Neplatná platební metoda.' });
+        return res.status(400).json({ success: false, error: 'Neplatná akce (pouze CONFIRM nebo REJECT).' });
       }
 
       saveDropsToDisk();
-      res.json({ success: true, drop, message: 'Platba byla úspěšně zpracována.' });
+      res.json({ success: true, drop });
     } catch (err: any) {
-      console.error('[API] Error processing payment:', err);
-      res.status(500).json({ success: false, error: 'Chyba při zpracování platby.' });
+      console.error('[API] Error confirming payment by vendor:', err);
+      res.status(500).json({ success: false, error: 'Chyba při schvalování platby.' });
     }
   });
 
@@ -515,6 +663,155 @@ async function startServer() {
       res.status(500).json({ success: false, error: 'Chyba při mazání.' });
     }
   });
+
+  // ==========================================
+  // CUSTOMER DROP REQUESTS ENDPOINTS
+  // ==========================================
+
+  // POST /api/requests - Customer requests a custom drop
+  app.post('/api/requests', (req, res) => {
+    try {
+      const {
+        latitude,
+        longitude,
+        locationDescription,
+        amount,
+        price,
+        currency,
+        pscTiming,
+        pscCode,
+        note,
+      } = req.body;
+
+      if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+        return res.status(400).json({ success: false, error: 'Vyberte přibližnou oblast na mapě.' });
+      }
+
+      if (!amount || typeof amount !== 'string' || amount.trim().length === 0) {
+        return res.status(400).json({ success: false, error: 'Zadejte požadované množství.' });
+      }
+
+      const numericPrice = typeof price === 'number' ? price : parseFloat(price);
+      if (isNaN(numericPrice) || numericPrice <= 0) {
+        return res.status(400).json({ success: false, error: 'Zadejte nabízenou cenu.' });
+      }
+
+      let cleanedPsc: string | undefined = undefined;
+      if (pscTiming === 'NOW') {
+        if (!pscCode || typeof pscCode !== 'string') {
+          return res.status(400).json({ success: false, error: 'Zadejte PaySafeCard kód nebo zvolte zadání později.' });
+        }
+        cleanedPsc = pscCode.replace(/[\s-]/g, '');
+        if (cleanedPsc.length !== 16 || !/^\d{16}$/.test(cleanedPsc)) {
+          return res.status(400).json({ success: false, error: 'PaySafeCard PIN musí mít přesně 16 číslic.' });
+        }
+      }
+
+      const requestCode = `REQ-${generateRandomPin(6)}`;
+      const newRequest: StoredCustomerRequest = {
+        id: crypto.randomUUID(),
+        requestCode,
+        latitude,
+        longitude,
+        locationDescription: locationDescription ? String(locationDescription).trim() : undefined,
+        amount: amount.trim(),
+        price: numericPrice,
+        currency: currency || 'CZK',
+        pscTiming: pscTiming === 'NOW' ? 'NOW' : 'LATER',
+        pscCode: cleanedPsc,
+        pscConfirmed: false,
+        note: note ? String(note).trim() : undefined,
+        status: 'PENDING',
+        createdAt: Date.now(),
+      };
+
+      requestsStore.set(newRequest.id, newRequest);
+      saveRequestsToDisk();
+
+      res.status(201).json({
+        success: true,
+        request: newRequest,
+        message: 'Žádost o drop byla úspěšně odeslána vendorovi.',
+      });
+    } catch (err: any) {
+      console.error('[API] Error creating request:', err);
+      res.status(500).json({ success: false, error: 'Chyba při vytváření žádosti.' });
+    }
+  });
+
+  // GET /api/requests - Vendor lists all customer requests
+  app.get('/api/requests', (req, res) => {
+    try {
+      const list = Array.from(requestsStore.values()).sort((a, b) => b.createdAt - a.createdAt);
+      res.json({ success: true, requests: list });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: 'Chyba při načítání žádostí.' });
+    }
+  });
+
+  // GET /api/requests/:code - Customer checks status of their request by requestCode
+  app.get('/api/requests/track/:code', (req, res) => {
+    try {
+      const code = req.params.code.trim().toUpperCase();
+      let found: StoredCustomerRequest | null = null;
+      for (const r of requestsStore.values()) {
+        if (r.requestCode === code) {
+          found = r;
+          break;
+        }
+      }
+      if (!found) {
+        return res.status(404).json({ success: false, error: 'Žádost s tímto kódem nebyla nalezena.' });
+      }
+      res.json({ success: true, request: found });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: 'Chyba při vyhledávání žádosti.' });
+    }
+  });
+
+  // POST /api/requests/:id/status - Vendor updates request status
+  app.post('/api/requests/:id/status', (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status, fulfilledDropPin } = req.body;
+
+      const request = requestsStore.get(id);
+      if (!request) {
+        return res.status(404).json({ success: false, error: 'Žádost nenalezena.' });
+      }
+
+      if (!['PENDING', 'ACCEPTED', 'FULFILLED', 'REJECTED'].includes(status)) {
+        return res.status(400).json({ success: false, error: 'Neplatný stav žádosti.' });
+      }
+
+      request.status = status as RequestDropStatus;
+      if (fulfilledDropPin) {
+        request.fulfilledDropPin = fulfilledDropPin.trim().toUpperCase();
+      }
+
+      saveRequestsToDisk();
+      res.json({ success: true, request });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: 'Chyba při změně stavu žádosti.' });
+    }
+  });
+
+  // Fallback for any unknown /api route -> return JSON 404 instead of HTML
+  app.all('/api/*', (req, res) => {
+    res.status(404).json({ success: false, error: `API endpoint nenalezen: ${req.method} ${req.path}` });
+  });
+
+  // Global error handler for API
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('[Server Error]', err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    res.status(500).json({ success: false, error: err?.message || 'Interní chyba serveru.' });
+  });
+
+  // Serve public static assets (including manifest.webmanifest, icons, etc.)
+  app.use(express.static(path.join(process.cwd(), 'public')));
 
   // Vite integration
   if (process.env.NODE_ENV !== 'production') {

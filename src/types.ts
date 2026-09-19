@@ -6,6 +6,8 @@ export interface Photo {
 
 export type DropStatus = 'CREATED' | 'VIEWED' | 'COLLECTED' | 'NOT_FOUND' | 'EXPIRED';
 
+export type PaymentStatus = 'UNPAID' | 'PENDING_CONFIRMATION' | 'CONFIRMED' | 'REJECTED';
+
 export interface StatusHistoryItem {
   status: DropStatus;
   timestamp: number;
@@ -15,7 +17,7 @@ export interface StatusHistoryItem {
 export interface DeadDrop {
   id: string;
   pinHash: string;
-  pinMasked?: string;
+  rawPin?: string;
   description: string;
   latitude: number;
   longitude: number;
@@ -32,9 +34,12 @@ export interface DeadDrop {
   currency?: string;
   isPaid?: boolean;
   paidAt?: number;
-  paymentMethod?: 'CRYPTO' | 'PAYSAFECARD';
-  cryptoType?: 'BTC' | 'XMR' | 'USDT';
-  cryptoAddress?: string;
+  paymentMethod?: 'PAYSAFECARD';
+  paymentStatus?: PaymentStatus;
+  pscCode?: string;
+  submittedPscCode?: string;
+  pscSubmittedAt?: number;
+  pscExpiresAt?: number; // 30 min timer
   burnerAlert?: string;
   burnerAlertSetAt?: number;
 }
@@ -49,7 +54,6 @@ export interface CreateDropRequest {
   price?: number;
   currency?: string;
   burnerAlert?: string;
-  cryptoType?: 'BTC' | 'XMR' | 'USDT';
 }
 
 export interface CreateDropResponse {
@@ -65,4 +69,33 @@ export interface ClaimDropResponse {
   success: boolean;
   drop?: DeadDrop;
   error?: string;
+}
+
+// Request Drop by Customer types
+export type RequestDropStatus = 'PENDING' | 'ACCEPTED' | 'FULFILLED' | 'REJECTED';
+
+export interface CustomerDropRequest {
+  id: string;
+  requestCode: string; // e.g. REQ-7K9M2X
+  latitude: number;
+  longitude: number;
+  locationDescription?: string;
+  amount: string;
+  price: number;
+  currency: string;
+  pscTiming: 'NOW' | 'LATER';
+  pscCode?: string;
+  pscConfirmed?: boolean;
+  note?: string;
+  status: RequestDropStatus;
+  createdAt: number;
+  fulfilledDropPin?: string;
+}
+
+export interface NotificationItem {
+  id: string;
+  title: string;
+  message: string;
+  type: 'success' | 'warning' | 'info' | 'error';
+  timestamp: number;
 }

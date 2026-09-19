@@ -1,6 +1,37 @@
 @import "tailwindcss";
 
-/* Tactical dark mode filter for standard free OpenStreetMap tiles (no watermarks, 100% free) */
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    background-color: #08090c;
+    color: #f3f4f6;
+    overflow-x: hidden;
+  }
+
+  code, kbd, samp, pre {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* Tactical dark mode filter for standard free OpenStreetMap tiles */
 .leaflet-dark-tiles {
-  filter: brightness(0.65) invert(1) contrast(2.5) hue-rotate(205deg) saturate(0.25) brightness(0.75);
+  filter: brightness(0.68) invert(1) contrast(2.4) hue-rotate(205deg) saturate(0.22) brightness(0.78);
+}
+
+/* Ambient cyber glow background */
+.cyber-bg-glow {
+  background: 
+    radial-gradient(circle at 50% 0%, rgba(16, 185, 129, 0.08) 0%, transparent 50%),
+    radial-gradient(circle at 100% 30%, rgba(59, 130, 246, 0.05) 0%, transparent 40%),
+    radial-gradient(circle at 0% 70%, rgba(16, 185, 129, 0.04) 0%, transparent 40%),
+    #08090c;
+}
+
+/* Subtle border glow on active elements */
+.border-glow-emerald {
+  box-shadow: 0 0 15px -2px rgba(16, 185, 129, 0.18);
+}
+
+.border-glow-amber {
+  box-shadow: 0 0 15px -2px rgba(245, 158, 11, 0.18);
 }
